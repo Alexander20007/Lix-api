@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+.env
+*.log
+cookies.txt
+*.m3u8
+*.mp4
+.DS_Store
