@@ -1,17 +1,14 @@
 """
-Backend extrator de streams - Playerflix
-Rotas:
-  GET /                       -> status da API
-  GET /api/stream/<tipo>/<id> -> retorna M3U8 do filme/serie
-  GET /api/proxy?url=...      -> proxy para contornar CORS do CDN
+Backend extrator de streams - Playerflix + Supabase
 """
 
 import os
 import re
-import time
 import requests
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
+
+from app import supabase_client as sb
 
 app = Flask(__name__)
 CORS(app)
@@ -28,9 +25,8 @@ BASE_HEADERS = {
     "Accept-Language": "pt-BR,pt;q=0.9",
 }
 
-# Cache em memoria
-CACHE = {}
 CACHE_TTL = 600  # 10 minutos
+
 
 # ============ HELPERS ============
 
@@ -43,36 +39,29 @@ def http_get(url, extra_headers=None, timeout=15):
     return r
 
 
-def cache_get(key):
-    if key in CACHE:
-        valor, expira_em = CACHE[key]
-        if time.time() < expira_em:
-            return valor
-        del CACHE[key]
-    return None
-
-
-def cache_set(key, valor):
-    CACHE[key] = (valor, time.time() + CACHE_TTL)
-
-
 # ============ LOGICA DE EXTRACAO ============
 
-def buscar_servidores(tipo, id_):
-    """Chama Ajax.php e retorna data com options."""
+def buscar_servidores(tipo, id_, season=None, episode=None):
+    """Chama Ajax.php do playerflix e retorna data com options."""
+    playerflix = sb.get_provider_url("playerflix")
+
     if tipo == "movie":
         path = f"filme/{id_}"
     else:
         path = f"serie/{id_}"
 
+    season_param = season if season is not None else "null"
+    episode_param = episode if episode is not None else "null"
+
     api_url = (
-        f"https://playerflix.ink/inc/Ajax.php"
-        f"?type={tipo}&id={id_}&season=null&episode=null"
+        f"{playerflix}/inc/Ajax.php"
+        f"?type={tipo}&id={id_}"
+        f"&season={season_param}&episode={episode_param}"
     )
 
     r = http_get(api_url, {
-        "Referer": f"https://playerflix.ink/{path}",
-        "Origin": "https://playerflix.ink",
+        "Referer": f"{playerflix}/{path}",
+        "Origin": playerflix,
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "X-Requested-With": "XMLHttpRequest",
     })
@@ -86,15 +75,14 @@ def buscar_servidores(tipo, id_):
 
 def extrair_m3u8(embed_url):
     """Baixa HTML do embed e extrai a URL do M3U8."""
+    playerflix = sb.get_provider_url("playerflix")
+
     r = http_get(embed_url, {
-        "Referer": "https://playerflix.ink/",
+        "Referer": f"{playerflix}/",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
 
-    match = re.search(
-        r'url:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-        r.text
-    )
+    match = re.search(r'url:\s*["\']([^"\']+\.m3u8[^"\']*)["\']', r.text)
     if not match:
         raise Exception("M3U8 nao encontrado no HTML do embed")
 
@@ -109,33 +97,127 @@ def home():
         "status": "online",
         "servico": "Extrator de Streams",
         "endpoints": [
-            "/api/stream/<tipo>/<id>  -> tipo=movie ou tv",
-            "/api/proxy?url=...       -> proxy de segmentos"
+            "GET /api/stream/movie/<id>                 -> filme (auto)",
+            "GET /api/stream/tv/<id>/<s>/<e>            -> serie (auto)",
+            "GET /api/servers/movie/<id>                -> lista servidores filme",
+            "GET /api/servers/tv/<id>/<s>/<e>           -> lista servidores serie",
+            "GET /api/proxy?url=...                      -> proxy de segmentos",
         ]
     })
 
 
-@app.route("/api/stream/<tipo>/<id_>")
-def stream(tipo, id_):
+@app.route("/api/servers/movie/<id_>")
+def servers_movie(id_):
+    return _listar_servidores("movie", id_)
+
+
+@app.route("/api/servers/tv/<id_>/<season>/<episode>")
+def servers_tv(id_, season, episode):
+    return _listar_servidores("tv", id_, season, episode)
+
+
+def _listar_servidores(tipo, id_, season=None, episode=None):
+    """Retorna a lista de servidores disponiveis (sem extrair M3U8)."""
     try:
-        cache_key = f"stream:{tipo}:{id_}"
-        cached = cache_get(cache_key)
+        data = buscar_servidores(tipo, id_, season, episode)
+        options = data.get("options", [])
+        return jsonify({
+            "status": True,
+            "titulo": data.get("title"),
+            "id": id_,
+            "tipo": tipo,
+            "temporada": season,
+            "episodio": episode,
+            "servidores": [
+                {
+                    "label": o.get("label"),
+                    "budget": o.get("budget"),
+                    "embed": o.get("embed"),
+                }
+                for o in options
+            ],
+        })
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/stream/movie/<id_>")
+def stream_movie(id_):
+    return _extrair_stream("movie", id_)
+
+
+@app.route("/api/stream/tv/<id_>/<season>/<episode>")
+def stream_tv(id_, season, episode):
+    return _extrair_stream("tv", id_, season, episode)
+
+
+def _extrair_stream(tipo, id_, season=None, episode=None):
+    """Extracao completa com fallback entre servidores."""
+    try:
+        servidor_escolhido = request.args.get("servidor")
+
+        cache_key = f"stream:{tipo}:{id_}:{season}:{episode}:{servidor_escolhido or 'auto'}"
+
+        # Tenta cache
+        cached = sb.cache_get(cache_key)
         if cached:
             cached["cache"] = True
             return jsonify(cached)
 
-        data = buscar_servidores(tipo, id_)
-
+        # Busca servidores
+        data = buscar_servidores(tipo, id_, season, episode)
         options = data.get("options", [])
         if not options:
             return jsonify({"erro": "Nenhum servidor disponivel"}), 404
 
-        escolhido = next(
-            (o for o in options if o.get("budget") == "success"),
-            options[0]
-        )
+        # Monta lista de candidatos a tentar
+        candidatos = []
 
-        m3u8 = extrair_m3u8(escolhido["embed"])
+        if servidor_escolhido:
+            escolhido = next(
+                (o for o in options if o.get("label") == servidor_escolhido),
+                None
+            )
+            if not escolhido:
+                return jsonify({
+                    "erro": f"Servidor '{servidor_escolhido}' nao encontrado",
+                    "disponiveis": [o.get("label") for o in options],
+                }), 404
+            candidatos.append(escolhido)
+            # Adiciona os outros como fallback
+            for o in options:
+                if o.get("label") != servidor_escolhido and o.get("budget") == "success":
+                    candidatos.append(o)
+        else:
+            # Sem escolha: tenta os "success" primeiro, depois qualquer um
+            candidatos = [o for o in options if o.get("budget") == "success"]
+            if not candidatos:
+                candidatos = options
+
+        # Tenta extrair de cada candidato ate conseguir
+        escolhido = None
+        m3u8 = None
+        ultimo_erro = None
+        tentados = []
+
+        for cand in candidatos:
+            label = cand.get("label")
+            tentados.append(label)
+            try:
+                m3u8 = extrair_m3u8(cand["embed"])
+                escolhido = cand
+                break
+            except Exception as e:
+                ultimo_erro = str(e)
+                print(f"[WARN] Falha ao extrair de {label}: {e}")
+                continue
+
+        if not escolhido or not m3u8:
+            return jsonify({
+                "erro": "Nao foi possivel extrair M3U8 de nenhum servidor",
+                "ultimo_erro": ultimo_erro,
+                "servidores_tentados": tentados,
+            }), 500
 
         resultado = {
             "status": True,
@@ -149,9 +231,26 @@ def stream(tipo, id_):
                 {"label": o.get("label"), "budget": o.get("budget")}
                 for o in options
             ],
+            "servidores_tentados": tentados,
         }
 
-        cache_set(cache_key, resultado)
+        if tipo == "tv":
+            resultado["temporada"] = season
+            resultado["episodio"] = episode
+            ne = data.get("next_episode")
+            if ne:
+                resultado["proximo_episodio"] = {
+                    "season": ne.get("season_number"),
+                    "episode": ne.get("episode_number"),
+                    "title": ne.get("title"),
+                }
+
+        # Salva no cache Supabase
+        try:
+            sb.cache_set(cache_key, resultado, ttl_seconds=CACHE_TTL)
+        except Exception as cache_err:
+            print(f"[WARN] Falha ao salvar cache: {cache_err}")
+
         return jsonify(resultado)
 
     except Exception as e:
@@ -160,16 +259,13 @@ def stream(tipo, id_):
 
 @app.route("/api/proxy")
 def proxy():
-    """Proxy que repassa requisicoes pro CDN com o Referer correto."""
     url = request.args.get("url")
     referer = request.args.get("referer", "https://v2.watchplay.shop/")
-
     if not url:
         return "Faltando parametro ?url=", 400
 
     try:
         is_m3u8 = ".m3u8" in url
-
         r = http_get(url, {"Referer": referer}, timeout=30)
         content_type = r.headers.get("Content-Type", "application/octet-stream")
 
@@ -183,17 +279,12 @@ def proxy():
                         seg_url = linha
                     else:
                         seg_url = f"{base}/{linha}"
-                    proxy_seg = (
-                        f"/api/proxy?url={seg_url}"
-                        f"&referer={referer}"
-                    )
-                    linhas.append(proxy_seg)
+                    linhas.append(f"/api/proxy?url={seg_url}&referer={referer}")
                 else:
                     linhas.append(linha)
-
             return Response(
                 "\n".join(linhas),
-                content_type="application/vnd.apple.mpegurl",
+                content_type="application/vnd.apple.mpegurl"
             )
 
         return Response(r.content, content_type=content_type)
@@ -205,5 +296,11 @@ def proxy():
 # ============ START ============
 
 if __name__ == "__main__":
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
