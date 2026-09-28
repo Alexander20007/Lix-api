@@ -323,8 +323,6 @@ def proxy():
         return "Faltando parametro ?url=", 400
 
     try:
-        is_m3u8 = ".m3u8" in url
-
         extra_headers = {
             "Referer": referer,
             "Origin": referer.rsplit("/", 1)[0] if referer else "https://v2.watchplay.shop",
@@ -337,6 +335,9 @@ def proxy():
 
         r = http_get(url, extra_headers, timeout=30)
         content_type = r.headers.get("Content-Type", "application/octet-stream")
+
+        # Detecta M3U8 pelo CONTEUDO (nao apenas pela URL)
+        is_m3u8 = "#EXTM3U" in r.text[:300] or ".m3u8" in url
 
         if is_m3u8:
             # Host do backend com HTTPS forcado
