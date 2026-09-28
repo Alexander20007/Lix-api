@@ -111,6 +111,7 @@ def home():
             "GET /api/servers/movie/<id>                -> lista servidores filme",
             "GET /api/servers/tv/<id>/<s>/<e>           -> lista servidores serie",
             "GET /api/proxy?url=...                      -> proxy de segmentos",
+            "GET /api/debug/fetch?url=...                -> debug: baixa URL",
         ]
     })
 
@@ -258,7 +259,6 @@ def _extrair_stream(tipo, id_, season=None, episode=None):
         ttl_final = CACHE_TTL
         if expires_at:
             segundos_restantes = expires_at - int(time.time())
-            # Margem de seguranca: 60s antes de expirar
             ttl_final = max(60, min(CACHE_TTL, segundos_restantes - 60))
             print(f"[INFO] TTL ajustado: {ttl_final}s (expira em {segundos_restantes}s)")
 
@@ -284,7 +284,6 @@ def proxy():
     try:
         is_m3u8 = ".m3u8" in url
 
-        # Headers extras pra enganar o CDN
         extra_headers = {
             "Referer": referer,
             "Origin": referer.rsplit("/", 1)[0] if referer else "https://v2.watchplay.shop",
@@ -318,6 +317,29 @@ def proxy():
 
         return Response(r.content, content_type=content_type)
 
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+# ============ DEBUG ============
+
+@app.route("/api/debug/fetch")
+def debug_fetch():
+    """Rota temporaria pra baixar URLs e investigar formatos de outros servidores."""
+    url = request.args.get("url")
+    if not url:
+        return jsonify({"erro": "Faltando ?url="}), 400
+
+    try:
+        r = requests.get(url, headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "*/*",
+            "Referer": "https://playerflix.ink/",
+        }, timeout=15)
+        return Response(
+            r.text,
+            content_type="text/plain; charset=utf-8"
+        )
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
