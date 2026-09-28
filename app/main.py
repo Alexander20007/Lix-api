@@ -6,6 +6,7 @@ Suporta: WatchPlay, VIP Player
 import os
 import re
 import time
+import urllib.parse
 import requests
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
@@ -96,15 +97,13 @@ def extrair_m3u8(embed_url):
 
     # ============ VIP PLAYER ============
     if "embedplayer2.xyz" in embed_url or "embedplayer1.xyz" in embed_url:
-        # Extrai o ID do embed (ultima parte da URL)
         embed_id = embed_url.rstrip("/").split("/")[-1]
         if not embed_id:
             raise Exception("Nao conseguiu extrair ID do VIP Player")
 
-        base = embed_url.split("/video/")[0]  # https://embedplayer2.xyz
+        base = embed_url.split("/video/")[0]
         api_url = f"{base}/player/index.php?data={embed_id}&do=getVideo"
 
-        # POST com hash e referrer
         r = http_post(
             api_url,
             data=f"hash={embed_id}&r={base}/",
@@ -179,7 +178,6 @@ def servers_tv(id_, season, episode):
 
 
 def _listar_servidores(tipo, id_, season=None, episode=None):
-    """Retorna a lista de servidores disponiveis (sem extrair M3U8)."""
     try:
         data = buscar_servidores(tipo, id_, season, episode)
         options = data.get("options", [])
@@ -214,7 +212,6 @@ def stream_tv(id_, season, episode):
 
 
 def _extrair_stream(tipo, id_, season=None, episode=None):
-    """Extracao completa com fallback entre servidores."""
     try:
         servidor_escolhido = request.args.get("servidor")
 
@@ -344,8 +341,10 @@ def proxy():
         content_type = r.headers.get("Content-Type", "application/octet-stream")
 
         if is_m3u8:
-            # Host do backend (ex: https://alx-api.onrender.com)
+            # Host do backend com HTTPS forcado
             host = request.host_url.rstrip("/")
+            if "onrender.com" in host and host.startswith("http://"):
+                host = host.replace("http://", "https://")
 
             base = url.rsplit("/", 1)[0]
             linhas = []
@@ -356,11 +355,13 @@ def proxy():
                         seg_url = linha
                     else:
                         seg_url = f"{base}/{linha}"
-                    # URL ABSOLUTA (com host do backend)
+                    # URL-encode dos parametros (evita quebra com & e /)
+                    seg_encoded = urllib.parse.quote(seg_url, safe='')
+                    ref_encoded = urllib.parse.quote(referer, safe='')
                     proxy_seg = (
                         f"{host}/api/proxy"
-                        f"?url={seg_url}"
-                        f"&referer={referer}"
+                        f"?url={seg_encoded}"
+                        f"&referer={ref_encoded}"
                     )
                     linhas.append(proxy_seg)
                 else:
@@ -380,7 +381,6 @@ def proxy():
 
 @app.route("/api/debug/fetch")
 def debug_fetch():
-    """Rota temporaria pra baixar URLs via GET."""
     url = request.args.get("url")
     if not url:
         return jsonify({"erro": "Faltando ?url="}), 400
@@ -401,7 +401,6 @@ def debug_fetch():
 
 @app.route("/api/debug/post", methods=["POST"])
 def debug_post():
-    """Rota temporaria pra fazer POST em URLs e investigar formatos."""
     url = request.args.get("url")
     referer = request.args.get("referer", "")
     if not url:
