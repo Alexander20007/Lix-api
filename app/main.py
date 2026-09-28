@@ -4,6 +4,7 @@ Backend extrator de streams - Playerflix + Supabase
 
 import os
 import re
+import time
 import requests
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
@@ -74,7 +75,9 @@ def buscar_servidores(tipo, id_, season=None, episode=None):
 
 
 def extrair_m3u8(embed_url):
-    """Baixa HTML do embed e extrai a URL do M3U8."""
+    """Baixa HTML do embed e extrai a URL do M3U8 + tempo de expiracao.
+    Retorna: (m3u8_url, expires_timestamp)
+    """
     playerflix = sb.get_provider_url("playerflix")
 
     r = http_get(embed_url, {
@@ -86,7 +89,13 @@ def extrair_m3u8(embed_url):
     if not match:
         raise Exception("M3U8 nao encontrado no HTML do embed")
 
-    return match.group(1).replace("\\/", "/")
+    m3u8 = match.group(1).replace("\\/", "/")
+
+    # Extrai o "expires" da URL (segundos Unix)
+    expires_match = re.search(r'expires=(\d+)', m3u8)
+    expires_at = int(expires_match.group(1)) if expires_match else None
+
+    return m3u8, expires_at
 
 
 # ============ ROTAS ============
@@ -184,12 +193,10 @@ def _extrair_stream(tipo, id_, season=None, episode=None):
                     "disponiveis": [o.get("label") for o in options],
                 }), 404
             candidatos.append(escolhido)
-            # Adiciona os outros como fallback
             for o in options:
                 if o.get("label") != servidor_escolhido and o.get("budget") == "success":
                     candidatos.append(o)
         else:
-            # Sem escolha: tenta os "success" primeiro, depois qualquer um
             candidatos = [o for o in options if o.get("budget") == "success"]
             if not candidatos:
                 candidatos = options
@@ -197,6 +204,7 @@ def _extrair_stream(tipo, id_, season=None, episode=None):
         # Tenta extrair de cada candidato ate conseguir
         escolhido = None
         m3u8 = None
+        expires_at = None
         ultimo_erro = None
         tentados = []
 
@@ -204,7 +212,7 @@ def _extrair_stream(tipo, id_, season=None, episode=None):
             label = cand.get("label")
             tentados.append(label)
             try:
-                m3u8 = extrair_m3u8(cand["embed"])
+                m3u8, expires_at = extrair_m3u8(cand["embed"])
                 escolhido = cand
                 break
             except Exception as e:
@@ -227,6 +235,7 @@ def _extrair_stream(tipo, id_, season=None, episode=None):
             "servidor": escolhido.get("label"),
             "embed": escolhido.get("embed"),
             "m3u8": m3u8,
+            "expires_at": expires_at,
             "servidores_disponiveis": [
                 {"label": o.get("label"), "budget": o.get("budget")}
                 for o in options
@@ -245,9 +254,17 @@ def _extrair_stream(tipo, id_, season=None, episode=None):
                     "title": ne.get("title"),
                 }
 
+        # Calcula TTL do cache baseado no expires do M3U8
+        ttl_final = CACHE_TTL
+        if expires_at:
+            segundos_restantes = expires_at - int(time.time())
+            # Margem de seguranca: 60s antes de expirar
+            ttl_final = max(60, min(CACHE_TTL, segundos_restantes - 60))
+            print(f"[INFO] TTL ajustado: {ttl_final}s (expira em {segundos_restantes}s)")
+
         # Salva no cache Supabase
         try:
-            sb.cache_set(cache_key, resultado, ttl_seconds=CACHE_TTL)
+            sb.cache_set(cache_key, resultado, ttl_seconds=ttl_final)
         except Exception as cache_err:
             print(f"[WARN] Falha ao salvar cache: {cache_err}")
 
@@ -266,7 +283,19 @@ def proxy():
 
     try:
         is_m3u8 = ".m3u8" in url
-        r = http_get(url, {"Referer": referer}, timeout=30)
+
+        # Headers extras pra enganar o CDN
+        extra_headers = {
+            "Referer": referer,
+            "Origin": referer.rsplit("/", 1)[0] if referer else "https://v2.watchplay.shop",
+            "Accept": "*/*",
+            "Accept-Language": "pt-BR,pt;q=0.9",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "cross-site",
+        }
+
+        r = http_get(url, extra_headers, timeout=30)
         content_type = r.headers.get("Content-Type", "application/octet-stream")
 
         if is_m3u8:
