@@ -40,6 +40,15 @@ def http_get(url, extra_headers=None, timeout=15):
     return r
 
 
+def http_post(url, data=None, extra_headers=None, timeout=15):
+    headers = BASE_HEADERS.copy()
+    if extra_headers:
+        headers.update(extra_headers)
+    r = requests.post(url, headers=headers, data=data, timeout=timeout)
+    r.raise_for_status()
+    return r
+
+
 # ============ LOGICA DE EXTRACAO ============
 
 def buscar_servidores(tipo, id_, season=None, episode=None):
@@ -111,7 +120,8 @@ def home():
             "GET /api/servers/movie/<id>                -> lista servidores filme",
             "GET /api/servers/tv/<id>/<s>/<e>           -> lista servidores serie",
             "GET /api/proxy?url=...                      -> proxy de segmentos",
-            "GET /api/debug/fetch?url=...                -> debug: baixa URL",
+            "GET /api/debug/fetch?url=...                -> debug: GET URL",
+            "POST /api/debug/post?url=...&referer=...   -> debug: POST URL",
         ]
     })
 
@@ -168,19 +178,16 @@ def _extrair_stream(tipo, id_, season=None, episode=None):
 
         cache_key = f"stream:{tipo}:{id_}:{season}:{episode}:{servidor_escolhido or 'auto'}"
 
-        # Tenta cache
         cached = sb.cache_get(cache_key)
         if cached:
             cached["cache"] = True
             return jsonify(cached)
 
-        # Busca servidores
         data = buscar_servidores(tipo, id_, season, episode)
         options = data.get("options", [])
         if not options:
             return jsonify({"erro": "Nenhum servidor disponivel"}), 404
 
-        # Monta lista de candidatos a tentar
         candidatos = []
 
         if servidor_escolhido:
@@ -202,7 +209,6 @@ def _extrair_stream(tipo, id_, season=None, episode=None):
             if not candidatos:
                 candidatos = options
 
-        # Tenta extrair de cada candidato ate conseguir
         escolhido = None
         m3u8 = None
         expires_at = None
@@ -255,14 +261,12 @@ def _extrair_stream(tipo, id_, season=None, episode=None):
                     "title": ne.get("title"),
                 }
 
-        # Calcula TTL do cache baseado no expires do M3U8
         ttl_final = CACHE_TTL
         if expires_at:
             segundos_restantes = expires_at - int(time.time())
             ttl_final = max(60, min(CACHE_TTL, segundos_restantes - 60))
             print(f"[INFO] TTL ajustado: {ttl_final}s (expira em {segundos_restantes}s)")
 
-        # Salva no cache Supabase
         try:
             sb.cache_set(cache_key, resultado, ttl_seconds=ttl_final)
         except Exception as cache_err:
@@ -325,7 +329,7 @@ def proxy():
 
 @app.route("/api/debug/fetch")
 def debug_fetch():
-    """Rota temporaria pra baixar URLs e investigar formatos de outros servidores."""
+    """Rota temporaria pra baixar URLs via GET."""
     url = request.args.get("url")
     if not url:
         return jsonify({"erro": "Faltando ?url="}), 400
@@ -340,6 +344,34 @@ def debug_fetch():
             r.text,
             content_type="text/plain; charset=utf-8"
         )
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/debug/post", methods=["POST"])
+def debug_post():
+    """Rota temporaria pra fazer POST em URLs e investigar formatos."""
+    url = request.args.get("url")
+    referer = request.args.get("referer", "")
+    if not url:
+        return jsonify({"erro": "Faltando ?url="}), 400
+
+    try:
+        body = request.get_json(silent=True) or {}
+        data_str = body.get("data", "")
+
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": "https://embedplayer2.xyz",
+        }
+        if referer:
+            headers["Referer"] = referer
+
+        r = requests.post(url, headers=headers, data=data_str, timeout=15)
+        return Response(r.text, content_type="text/plain; charset=utf-8")
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
