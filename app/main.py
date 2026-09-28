@@ -97,7 +97,6 @@ def extrair_m3u8(embed_url):
     # ============ VIP PLAYER ============
     if "embedplayer2.xyz" in embed_url or "embedplayer1.xyz" in embed_url:
         # Extrai o ID do embed (ultima parte da URL)
-        # Ex: https://embedplayer2.xyz/video/d60f2d5d05b4c46d470d5cbd5d1fb252
         embed_id = embed_url.rstrip("/").split("/")[-1]
         if not embed_id:
             raise Exception("Nao conseguiu extrair ID do VIP Player")
@@ -122,12 +121,10 @@ def extrair_m3u8(embed_url):
         if not data.get("hls"):
             raise Exception("VIP Player nao retornou HLS")
 
-        # Pega o securedLink (M3U8 pronto)
         m3u8 = data.get("securedLink") or data.get("videoSource")
         if not m3u8:
             raise Exception("VIP Player nao retornou URL M3U8")
 
-        # Extrai expires
         expires_match = re.search(r'expires=(\d+)', m3u8)
         expires_at = int(expires_match.group(1)) if expires_match else None
 
@@ -347,6 +344,9 @@ def proxy():
         content_type = r.headers.get("Content-Type", "application/octet-stream")
 
         if is_m3u8:
+            # Host do backend (ex: https://alx-api.onrender.com)
+            host = request.host_url.rstrip("/")
+
             base = url.rsplit("/", 1)[0]
             linhas = []
             for linha in r.text.splitlines():
@@ -356,7 +356,13 @@ def proxy():
                         seg_url = linha
                     else:
                         seg_url = f"{base}/{linha}"
-                    linhas.append(f"/api/proxy?url={seg_url}&referer={referer}")
+                    # URL ABSOLUTA (com host do backend)
+                    proxy_seg = (
+                        f"{host}/api/proxy"
+                        f"?url={seg_url}"
+                        f"&referer={referer}"
+                    )
+                    linhas.append(proxy_seg)
                 else:
                     linhas.append(linha)
             return Response(
