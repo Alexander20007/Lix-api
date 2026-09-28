@@ -161,8 +161,6 @@ def home():
             "GET /api/servers/movie/<id>                -> lista servidores filme",
             "GET /api/servers/tv/<id>/<s>/<e>           -> lista servidores serie",
             "GET /api/proxy?url=...                      -> proxy de segmentos",
-            "GET /api/debug/fetch?url=...                -> debug: GET URL",
-            "POST /api/debug/post?url=...&referer=...   -> debug: POST URL",
         ]
     })
 
@@ -304,7 +302,7 @@ def _extrair_stream(tipo, id_, season=None, episode=None):
         if expires_at:
             segundos_restantes = expires_at - int(time.time())
             ttl_final = max(60, min(CACHE_TTL, segundos_restantes - 60))
-            print(f"[INFO] TTL ajustado: {ttl_final}s (expira em {segundos_restantes}s)")
+            print(f"[INFO] TTL ajustado: {ttl_final}s")
 
         try:
             sb.cache_set(cache_key, resultado, ttl_seconds=ttl_final)
@@ -346,26 +344,50 @@ def proxy():
             if "onrender.com" in host and host.startswith("http://"):
                 host = host.replace("http://", "https://")
 
-            base = url.rsplit("/", 1)[0]
+            # Parse da URL pra resolver paths absolutos
+            parsed = urllib.parse.urlparse(url)
+            base_dir = url.rsplit("/", 1)[0] if "/" in url else url
+
+            def resolver(rel):
+                """Resolve URL conforme spec HLS."""
+                if rel.startswith(("http://", "https://")):
+                    return rel
+                if rel.startswith("//"):
+                    return f"{parsed.scheme}:{rel}"
+                if rel.startswith("/"):
+                    # Absoluto desde a raiz do dominio
+                    return f"{parsed.scheme}://{parsed.netloc}{rel}"
+                # Relativo ao diretorio do arquivo
+                return f"{base_dir}/{rel}"
+
+            def proxify(u):
+                enc = urllib.parse.quote(u, safe='')
+                ref = urllib.parse.quote(referer, safe='')
+                return f"{host}/api/proxy?url={enc}&referer={ref}"
+
             linhas = []
             for linha in r.text.splitlines():
-                linha = linha.strip()
-                if linha and not linha.startswith("#"):
-                    if linha.startswith("http"):
-                        seg_url = linha
-                    else:
-                        seg_url = f"{base}/{linha}"
-                    # URL-encode dos parametros (evita quebra com & e /)
-                    seg_encoded = urllib.parse.quote(seg_url, safe='')
-                    ref_encoded = urllib.parse.quote(referer, safe='')
-                    proxy_seg = (
-                        f"{host}/api/proxy"
-                        f"?url={seg_encoded}"
-                        f"&referer={ref_encoded}"
-                    )
-                    linhas.append(proxy_seg)
-                else:
+                linha_stripped = linha.strip()
+
+                if not linha_stripped:
                     linhas.append(linha)
+                    continue
+
+                # Linha com URI="..." (ex: #EXT-X-MEDIA, #EXT-X-MAP)
+                if 'URI="' in linha_stripped:
+                    def repl_uri(m):
+                        return f'URI="{proxify(resolver(m.group(1)))}"'
+                    linhas.append(re.sub(r'URI="([^"]+)"', repl_uri, linha))
+                    continue
+
+                # Comentario normal
+                if linha_stripped.startswith("#"):
+                    linhas.append(linha)
+                    continue
+
+                # URL de segmento ou playlist
+                linhas.append(proxify(resolver(linha_stripped)))
+
             return Response(
                 "\n".join(linhas),
                 content_type="application/vnd.apple.mpegurl"
@@ -391,10 +413,7 @@ def debug_fetch():
             "Accept": "*/*",
             "Referer": "https://playerflix.ink/",
         }, timeout=15)
-        return Response(
-            r.text,
-            content_type="text/plain; charset=utf-8"
-        )
+        return Response(r.text, content_type="text/plain; charset=utf-8")
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 
