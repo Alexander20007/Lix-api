@@ -1,5 +1,6 @@
 """
 Backend extrator de streams - Playerflix + Supabase
+Suporta: WatchPlay, VIP Player
 """
 
 import os
@@ -84,11 +85,55 @@ def buscar_servidores(tipo, id_, season=None, episode=None):
 
 
 def extrair_m3u8(embed_url):
-    """Baixa HTML do embed e extrai a URL do M3U8 + tempo de expiracao.
+    """
+    Extrai M3U8 de multiplos servidores:
+    - WatchPlay (v1.watchplay.shop)
+    - VIP Player (embedplayer2.xyz / embedplayer1.xyz)
+
     Retorna: (m3u8_url, expires_timestamp)
     """
     playerflix = sb.get_provider_url("playerflix")
 
+    # ============ VIP PLAYER ============
+    if "embedplayer2.xyz" in embed_url or "embedplayer1.xyz" in embed_url:
+        # Extrai o ID do embed (ultima parte da URL)
+        # Ex: https://embedplayer2.xyz/video/d60f2d5d05b4c46d470d5cbd5d1fb252
+        embed_id = embed_url.rstrip("/").split("/")[-1]
+        if not embed_id:
+            raise Exception("Nao conseguiu extrair ID do VIP Player")
+
+        base = embed_url.split("/video/")[0]  # https://embedplayer2.xyz
+        api_url = f"{base}/player/index.php?data={embed_id}&do=getVideo"
+
+        # POST com hash e referrer
+        r = http_post(
+            api_url,
+            data=f"hash={embed_id}&r={base}/",
+            extra_headers={
+                "Referer": f"{base}/",
+                "Origin": base,
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "X-Requested-With": "XMLHttpRequest",
+            }
+        )
+
+        data = r.json()
+        if not data.get("hls"):
+            raise Exception("VIP Player nao retornou HLS")
+
+        # Pega o securedLink (M3U8 pronto)
+        m3u8 = data.get("securedLink") or data.get("videoSource")
+        if not m3u8:
+            raise Exception("VIP Player nao retornou URL M3U8")
+
+        # Extrai expires
+        expires_match = re.search(r'expires=(\d+)', m3u8)
+        expires_at = int(expires_match.group(1)) if expires_match else None
+
+        return m3u8, expires_at
+
+    # ============ WATCHPLAY (padrao) ============
     r = http_get(embed_url, {
         "Referer": f"{playerflix}/",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -100,7 +145,6 @@ def extrair_m3u8(embed_url):
 
     m3u8 = match.group(1).replace("\\/", "/")
 
-    # Extrai o "expires" da URL (segundos Unix)
     expires_match = re.search(r'expires=(\d+)', m3u8)
     expires_at = int(expires_match.group(1)) if expires_match else None
 
@@ -114,6 +158,7 @@ def home():
     return jsonify({
         "status": "online",
         "servico": "Extrator de Streams",
+        "servidores_suportados": ["WatchPlay", "VIP Player"],
         "endpoints": [
             "GET /api/stream/movie/<id>                 -> filme (auto)",
             "GET /api/stream/tv/<id>/<s>/<e>            -> serie (auto)",
